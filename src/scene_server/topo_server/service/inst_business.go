@@ -13,6 +13,8 @@
 package service
 
 import (
+	"configcenter/src/ac"
+	"configcenter/src/common/condition"
 	"encoding/json"
 	"reflect"
 	"sort"
@@ -224,6 +226,86 @@ func (s *Service) UpdateBusinessStatus(ctx *rest.Contexts) {
 		return
 	}
 	ctx.RespEntity(nil)
+}
+
+// DeleteBusiness delete archived business
+func (s *Service) DeleteBusiness(ctx *rest.Contexts) {
+	param := new(metadata.DeleteBizParam)
+	if err := ctx.DecodeInto(&param); nil != err {
+		ctx.RespAutoError(err)
+		return
+	}
+
+	if len(param.BizID) > common.BKDefaultLimit {
+		blog.Errorf("bk_biz_id len %d exceed max page size %d, rid:%s", len(param.BizID),
+			common.BKMaxPageSize, ctx.Kit.Rid)
+		ctx.RespAutoError(ctx.Kit.CCError.CCErrorf(common.CCErrCommXXExceedLimit, "update",
+			common.BKMaxPageSize))
+		return
+	}
+
+	obj, err := s.Core.ObjectOperation().FindSingleObject(ctx.Kit, common.BKInnerObjIDApp)
+	if nil != err {
+		blog.Errorf("failed to search the business, %s, rid: %s", err.Error(), ctx.Kit.Rid)
+		ctx.RespAutoError(err)
+		return
+	}
+
+	if err := hooks.ValidateDeleteBusinessHook(ctx.Kit, s.Engine.CoreAPI, param.BizID); err != nil {
+		blog.Errorf("validate delete business hook failed, err: %v, rid: %s", err, ctx.Kit.Rid)
+		ctx.RespAutoError(err)
+		return
+	}
+
+	// check authorization
+	if err := s.checkBizDeleteAuth(ctx, param.BizID); err != nil {
+		// resp in checkBizEditable, need not resp again
+		return
+	}
+
+	deleteCond := condition.CreateCondition()
+	deleteCond.Field(common.BKAppIDField).In(param.BizID)
+	// delete biz instances
+	txnErr := s.Engine.CoreAPI.CoreService().Txn().AutoRunTxn(ctx.Kit.Ctx, ctx.Kit.Header, func() error {
+		if err := s.Core.BusinessOperation().DeleteBusinessByCond(ctx.Kit, obj, deleteCond); err != nil {
+			blog.Errorf("update many biz err: %+v, rid: %s", err, ctx.Kit.Rid)
+			return err
+		}
+		return nil
+	})
+
+	if txnErr != nil {
+		ctx.RespAutoError(txnErr)
+		return
+	}
+	ctx.RespEntity(nil)
+}
+
+func (s *Service) checkBizDeleteAuth(ctx *rest.Contexts, bizList []int64) error {
+	if s.AuthManager.Enabled() == false {
+		return nil
+	}
+
+	err := s.AuthManager.AuthorizeByBusinessID(ctx.Kit.Ctx, ctx.Kit.Header, meta.Archive, bizList...)
+	if err == nil {
+		return nil
+	}
+	if err != ac.NoAuthorizeError {
+		blog.ErrorJSON("check biz authorization failed, biz: %+v, err: %s, rid: %s", bizList, err.Error(),
+			ctx.Kit.Rid)
+		ctx.RespAutoError(ctx.Kit.CCError.CCError(common.CCErrCommAuthorizeFailed))
+		return err
+	}
+
+	perm, err := s.AuthManager.GenBizBatchNoPermissionResp(ctx.Kit.Ctx, ctx.Kit.Header, meta.Archive, bizList)
+	if err != nil && err != ac.NoAuthorizeError {
+		blog.ErrorJSON("biz authorization get permission failed, biz: %+v, err: %s, rid: %s", bizList,
+			err.Error(), ctx.Kit.Rid)
+		ctx.RespAutoError(ctx.Kit.CCError.CCError(common.CCErrCommAuthorizeFailed))
+		return err
+	}
+	ctx.RespEntityWithError(perm, ac.NoAuthorizeError)
+	return ac.NoAuthorizeError
 }
 
 // find business list with these info：
