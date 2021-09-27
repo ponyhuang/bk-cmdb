@@ -13,8 +13,8 @@
 package service
 
 import (
-	"configcenter/src/ac"
 	"configcenter/src/common/condition"
+	"configcenter/src/common/errors"
 	"encoding/json"
 	"reflect"
 	"sort"
@@ -26,7 +26,6 @@ import (
 	"configcenter/src/common"
 	"configcenter/src/common/auth"
 	"configcenter/src/common/blog"
-	"configcenter/src/common/condition"
 	"configcenter/src/common/http/rest"
 	"configcenter/src/common/mapstr"
 	"configcenter/src/common/mapstruct"
@@ -239,9 +238,9 @@ func (s *Service) DeleteBusiness(ctx *rest.Contexts) {
 
 	if len(param.BizID) > common.BKDefaultLimit {
 		blog.Errorf("bk_biz_id len %d exceed max page size %d, rid:%s", len(param.BizID),
-			common.BKMaxPageSize, ctx.Kit.Rid)
+			common.BKDefaultLimit, ctx.Kit.Rid)
 		ctx.RespAutoError(ctx.Kit.CCError.CCErrorf(common.CCErrCommXXExceedLimit, "update",
-			common.BKMaxPageSize))
+			common.BKDefaultLimit))
 		return
 	}
 
@@ -258,9 +257,61 @@ func (s *Service) DeleteBusiness(ctx *rest.Contexts) {
 		return
 	}
 
-	// check authorization
-	if err := s.checkBizDeleteAuth(ctx, param.BizID); err != nil {
-		// resp in checkBizEditable, need not resp again
+	// check built in business
+
+
+	// check unarchived business
+	page := metadata.BasePage{
+		Limit: common.BKNoLimit,
+	}
+	fields := []string{
+		common.BKAppIDField,
+		common.BKDataStatusField,
+		common.BKDefaultField,
+	}
+	query := &metadata.QueryBusinessRequest{
+		Page:   page,
+		Fields: fields,
+		Condition: mapstr.MapStr{
+			common.BKAppIDField: mapstr.MapStr{
+				common.BKDBIN: param.BizID,
+			},
+		},
+	}
+	_, instItems, err := s.Core.BusinessOperation().FindBiz(ctx.Kit, query)
+	if err != nil {
+		blog.Errorf("find business failed, err: %s, rid: %s", err.Error(), ctx.Kit.Rid)
+		ctx.RespAutoError(err)
+		return
+	}
+	if len(instItems) <= 0 {
+		blog.Errorf("find no business to delete, rid: %s", ctx.Kit.Rid)
+		ctx.RespAutoError(ctx.Kit.CCError.CCError(common.CCErrCommNotFound))
+		return
+	}
+
+	for _, item := range instItems {
+		if item[common.BKDefaultField] == common.DefaultAppFlag {
+			blog.Errorf("default business cannot be deleted, bid: %d, rid: %s", item[common.BKAppIDField],
+				ctx.Kit.Rid)
+			ctx.RespAutoError(ctx.Kit.CCError.CCError(common.CCErrCommNotFound))
+			return
+		}
+		business := metadata.BizBasicInfo{}
+		if err := mapstruct.Decode2Struct(item, &business); err != nil {
+			blog.Errorf("decode business from db failed, item: %+v, err: %s, rid: %s", item, err.Error(),
+				ctx.Kit.Rid)
+			return bizIDs, ctx.Kit.CCError.CCError(common.CCErrCommParseDBFailed)
+		}
+		bizIDs = append(bizIDs, business.BizID)
+	}
+	for biz := range bizs {
+
+	}
+	biz := metadata.BizBasicInfo{}
+	if err := mapstruct.Decode2Struct(bizs[0], &biz); err != nil {
+		blog.Errorf("[api-business]failed, parse biz failed, biz: %+v, err: %s, rid: %s", bizs[0], err.Error(), ctx.Kit.Rid)
+		ctx.RespAutoError(ctx.Kit.CCError.CCError(common.CCErrCommParseDBFailed))
 		return
 	}
 
@@ -283,31 +334,35 @@ func (s *Service) DeleteBusiness(ctx *rest.Contexts) {
 	ctx.RespEntity(nil)
 }
 
-func (s *Service) checkBizDeleteAuth(ctx *rest.Contexts, bizList []int64) error {
-	if s.AuthManager.Enabled() == false {
-		return nil
+func (s *Service) CheckIsBuiltInSet(kit *rest.Kit, setIDs ...int64) errors.CCErrorCoder {
+	// 检查是否时内置集群
+	filter := &metadata.QueryCondition{
+		Page: metadata.BasePage{
+			Limit: common.BKNoLimit,
+		},
+		Condition: map[string]interface{}{
+			common.BKSetIDField: map[string]interface{}{
+				common.BKDBIN: setIDs,
+			},
+			common.BKDefaultField: map[string]interface{}{
+				common.BKDBNE: common.DefaultFlagDefaultValue,
+			},
+		},
 	}
 
-	err := s.AuthManager.AuthorizeByBusinessID(ctx.Kit.Ctx, ctx.Kit.Header, meta.Archive, bizList...)
-	if err == nil {
-		return nil
+	rsp, err := s.Engine.CoreAPI.CoreService().Instance().ReadInstance(kit.Ctx, kit.Header, common.BKInnerObjIDSet, filter)
+	if nil != err {
+		blog.ErrorJSON("CheckIsBuiltInSet failed, ReadInstance failed, option: %s, err: %s, rid: %s", filter, err.Error(), kit.Rid)
+		return kit.CCError.CCError(common.CCErrCommHTTPDoRequestFailed)
 	}
-	if err != ac.NoAuthorizeError {
-		blog.ErrorJSON("check biz authorization failed, biz: %+v, err: %s, rid: %s", bizList, err.Error(),
-			ctx.Kit.Rid)
-		ctx.RespAutoError(ctx.Kit.CCError.CCError(common.CCErrCommAuthorizeFailed))
-		return err
+	if rsp.Result == false || rsp.Code != 0 {
+		blog.ErrorJSON("ReadInstance failed, ReadInstance failed, option: %s, response: %s, rid: %s", filter, rsp, kit.Rid)
+		return errors.New(rsp.Code, rsp.ErrMsg)
 	}
-
-	perm, err := s.AuthManager.GenBizBatchNoPermissionResp(ctx.Kit.Ctx, ctx.Kit.Header, meta.Archive, bizList)
-	if err != nil && err != ac.NoAuthorizeError {
-		blog.ErrorJSON("biz authorization get permission failed, biz: %+v, err: %s, rid: %s", bizList,
-			err.Error(), ctx.Kit.Rid)
-		ctx.RespAutoError(ctx.Kit.CCError.CCError(common.CCErrCommAuthorizeFailed))
-		return err
+	if rsp.Data.Count > 0 {
+		return kit.CCError.CCError(common.CCErrorTopoForbiddenDeleteBuiltInSetModule)
 	}
-	ctx.RespEntityWithError(perm, ac.NoAuthorizeError)
-	return ac.NoAuthorizeError
+	return nil
 }
 
 // find business list with these info：
